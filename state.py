@@ -93,7 +93,7 @@ class SimpleState:
     def __init__(self, name) -> None:
         self.name = name
         self.pos_data = Pos(*Data().pos_data[name].values())
-        self.action_data = Data().action_data[name]
+        self.action_data = Data().action_data.get(name, {"x": self.pos_data.tl.x, "y": self.pos_data.tl.y, "button": "LEFT"})
         self._image = None
 
     @property
@@ -104,12 +104,11 @@ class SimpleState:
         
     def __bool__(self) -> bool:
         rhs = Game().screenshot[self.pos_data.tl.y : self.pos_data.br.y, self.pos_data.tl.x : self.pos_data.br.x]
-        debug_save_image(rhs, 'rhs')
+        debug_save_image(rhs, f'CHECK-{self.name}')
         return array_equal(self.image, rhs)
 
     def __call__(self):
         click(**self.action_data)
-        sleep(5)
 
     def __repr__(self):
         return f'SimpleState({self.name})'
@@ -133,6 +132,9 @@ if __name__ == "__main__":
 
     while True:
         for state in states:
+            logging.info(f'checking state {state.name}')
             if state:
                 logging.info(f'detected current state is {state.name}')
                 state()
+        logging.info('nothing found, refreshing cached screenshot')
+        Game().refresh_screen()
