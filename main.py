@@ -1,57 +1,140 @@
-#!/bin/env python 
-import json
-from time import sleep
-
-import numpy as np
-from PIL import Image
-from PIL.ImageGrab import grab
-from pyautogui import click
+#!/bin/env python
+from multiprocessing import Lock, Pool
+from os import makedirs
 from pygetwindow import Window, getWindowsWithTitle
+from PIL.ImageGrab import grab
+from PIL import Image
+from numpy import array, array_equal
+import json
+from dataclasses import dataclass
+from pyautogui import click
+from time import sleep
+import logging
+from glob import glob
+from pathlib import Path
+from functools import wraps
 
-game_window: Window = getWindowsWithTitle("Yu-Gi-Oh! DUEL LINKS")[0]
-game_window.activate()
-game_window.moveTo(0, 0)
-image_cache = {}
-with open("data/pos_data.json", "r") as pos_data_file:
-    pos_data = json.load(pos_data_file)
-with open("data/action_data.json", "r") as action_data_file:
-    action_data = json.load(action_data_file)
+class Singleton(type):
+    _instances = {}
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
+        return cls._instances[cls]
+
+@dataclass
+class Point:
+    x: int
+    y: int
+
+class Pos:
+    def __init__(self, top_left_x, top_left_y, bottom_right_x, bottom_right_y) -> None:
+        self.tl = Point(top_left_x, top_left_y)
+        self.br = Point(bottom_right_x, bottom_right_y)
+        self.dx = bottom_right_x - top_left_x
+        self.dy = bottom_right_y - top_left_y
+
+    def __repr__(self) -> str:
+        return f'({self.tl.x},{self.tl.y},{self.br.x},{self.br.y})'
+
+class Data(metaclass=Singleton):
+    """Read position and action data through this class"""
+    def __init__(self):
+        with open("data/pos_data.json", "r") as pos_data_file:
+            self.pos_data = json.load(pos_data_file)
+        with open("data/action_data.json", "r") as action_data_file:
+            self.action_data = json.load(action_data_file)
 
 
-def open_image(image_name):
-    if image_name in image_cache:
-        return image_cache[image_name]
-    image = Image.open(f"data/{image_name}.png")
-    image_array = np.array(image)
-    image_cache[image_name] = image_array
-    return image_array
+class Game(metaclass=Singleton):
+    def __init__(self):
+        self.window: Window = getWindowsWithTitle("Yu-Gi-Oh! DUEL LINKS")[0]
+        self.window.activate()
+        self.window.moveTo(0, 0)
+        self.refresh_screen()
 
-
-def is_state(state_name):
-    image_array = open_image(state_name)
-    pos_to_check = pos_data[state_name]
-    current_screen = grab(
-        bbox=(
-            int(game_window.left + pos_to_check["top_left_x"]),
-            int(game_window.top + pos_to_check["top_left_y"]),
-            int(game_window.left + pos_to_check["bottom_right_x"]),
-            int(game_window.top + pos_to_check["bottom_right_y"]),
+    def refresh_screen(self):
+        self.screenshot = array(
+            grab(
+                bbox=(
+                    int(self.window.left),
+                    int(self.window.top),
+                    int(self.window.left + self.window.width),
+                    int(self.window.top + self.window.height),
+                )
+            )
         )
-    )
-    current_screen = np.array(current_screen)
-    return np.array_equal(image_array, current_screen)
 
-def cont(name, delay=7):
-    print(f'found {name}')
-    click(**action_data[f"SKIP_{name}"])
-    sleep(delay)
+def log(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        logging.debug(f'calling {func.__name__} with params {args}, {kwargs}')
+        result = func(*args, **kwargs)
+        logging.debug(f'{func.__name__} returned {result}')
+        return result
+    return wrapped
 
-def action(state_name):
-    cont(state_name)
+def debug_save_image(array, name):
+    makedirs('debug', exist_ok=True)
+    Image.fromarray(array).save(f"debug/{name}.png")
+    logging.debug(f'saving {name}.png')
 
-while True:
-    for state_name in pos_data:
-        if is_state(state_name):
-            action(state_name)
-    print("nothing to do... sleeping...")
-    sleep(1) 
+def debug_image(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        for arg in *args, *kwargs.values():
+            if type(arg) == SimpleState:
+                debug_save_image(arg.image, arg.name)
+        result = func(*args, **kwargs)
+        return result
+    return wrapped
+
+
+class SimpleState:
+    def __init__(self, name) -> None:
+        self.name = name
+        self.pos_data = Pos(*Data().pos_data[name].values())
+        self.action_data = Data().action_data.get(name, {"x": self.pos_data.tl.x, "y": self.pos_data.tl.y, "button": "LEFT"})
+        self._image = None
+
+    @property
+    def image(self):
+        if self._image is None:
+            self._image = array(Image.open(f"data/simple_state/{self.name}.png"))
+        return self._image
+        
+    def __bool__(self) -> bool:
+        rhs = Game().screenshot[self.pos_data.tl.y : self.pos_data.br.y, self.pos_data.tl.x : self.pos_data.br.x]
+        debug_save_image(rhs, f'CHECK-{self.name}')
+        return array_equal(self.image, rhs)
+
+    def __call__(self):
+        click(**self.action_data)
+
+    def __repr__(self):
+        return f'SimpleState({self.name})'
+
+def get_simple_states():
+    for image_path in glob('data/simple_state/*.png'):
+        # Extract state name from the image file name and return a state object
+        yield SimpleState(Path(image_path).name.removesuffix('.png'))
+
+def state_checker_worker(states, action_lock: Lock):
+    while True:
+        for state in states:
+            if state:
+                action_lock.acquire()
+                state()
+                action_lock.release()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    states = list(get_simple_states())
+
+    while True:
+        for state in states:
+            logging.info(f'checking state {state.name}')
+            if state:
+                logging.info(f'detected current state is {state.name}')
+                state()
+        logging.info('nothing found, refreshing cached screenshot')
+        Game().refresh_screen()
